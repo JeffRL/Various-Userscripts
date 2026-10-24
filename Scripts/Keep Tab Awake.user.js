@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Keep Tab Awake
 // @description  Generate a near-silent tone to prevent Firefox throttling background tabs
-// @version      1.2.0
+// @version      1.3.0
 // @match        *://*/*
 // @noframes
 // @run-at       document-start
@@ -16,10 +16,12 @@
 
 (() => {
   const FREQ = 1;
-  // GM storage is shared by every site, so keys include the host
-  const HOST = location.host;
-  const SITE_KEY = 'site:' + HOST;
-  const LINK_KEY = 'link:' + HOST + location.pathname + location.search;
+  // Read fresh each time: sites like YouTube change the URL without reloading the page.
+  // GM storage is shared by every site, so keys include the host.
+  const url = () => new URL(location.href);
+  const host = () => url().host;
+  const siteKey = () => 'site:' + host();
+  const linkKey = () => { const u = url(); return 'link:' + u.host + u.pathname + u.search; };
   const OFF = { awake: false, mute: false, webAudio: false };
   let gainValue = GM_getValue('gain', 0.0004);
   let ctx = null, gainNode = null, shownIds = [];
@@ -59,8 +61,9 @@
 
   // Most specific level first: link > regex > site
   function active() {
-    const link = GM_getValue(LINK_KEY, null);
-    if (link) return { kind: 'link', profile: link, save: p => GM_setValue(LINK_KEY, p) };
+    const lk = linkKey(), sk = siteKey();
+    const link = GM_getValue(lk, null);
+    if (link) return { kind: 'link', profile: link, save: p => GM_setValue(lk, p) };
     const rules = loadRules();
     const i = firstMatch(rules, location.href);
     if (i >= 0) {
@@ -74,8 +77,8 @@
         },
       };
     }
-    const site = GM_getValue(SITE_KEY, null);
-    if (site) return { kind: 'site', profile: site, save: p => GM_setValue(SITE_KEY, p) };
+    const site = GM_getValue(sk, null);
+    if (site) return { kind: 'site', profile: site, save: p => GM_setValue(sk, p) };
     return null;
   }
 
@@ -197,18 +200,20 @@
   }
 
   function toggleLink() {
-    if (GM_getValue(LINK_KEY, null)) GM_deleteValue(LINK_KEY);
-    else GM_setValue(LINK_KEY, newProfile());
+    const lk = linkKey();
+    if (GM_getValue(lk, null)) GM_deleteValue(lk);
+    else GM_setValue(lk, newProfile());
     sync();
   }
 
   function toggleSite() {
-    if (GM_getValue(SITE_KEY, null)) {
-      GM_deleteValue(SITE_KEY);
+    const sk = siteKey();
+    if (GM_getValue(sk, null)) {
+      GM_deleteValue(sk);
     } else {
-      GM_setValue(SITE_KEY, newProfile());
+      GM_setValue(sk, newProfile());
       // Link levels on this site become redundant; the trailing / stops example.com matching example.com.au
-      const prefix = 'link:' + HOST + '/';
+      const prefix = 'link:' + host() + '/';
       GM_listValues().filter(key => key.startsWith(prefix)).forEach(key => GM_deleteValue(key));
     }
     sync();
@@ -242,13 +247,13 @@
     const rules = loadRules();
     const ruleIndex = firstMatch(rules, location.href);
     const entries = [];
-    entries.push(['link', `🔗 This link: ${onOff(GM_getValue(LINK_KEY, null))}`, toggleLink]);
+    entries.push(['link', `🔗 This link: ${onOff(GM_getValue(linkKey(), null))}`, toggleLink]);
     if (ruleIndex >= 0) {
       const pattern = rules[ruleIndex].pattern;
       const short = pattern.length > 40 ? pattern.slice(0, 39) + '…' : pattern;
       entries.push(['regex', `🧩 Regex /${short}/`, openPanel]);
     }
-    entries.push(['site', `🌐 This site: ${onOff(GM_getValue(SITE_KEY, null))}`, toggleSite]);
+    entries.push(['site', `🌐 This site: ${onOff(GM_getValue(siteKey(), null))}`, toggleSite]);
     if (a) {
       entries.push(['awake', awakeLabel(a.kind), () => toggleSetting('awake')]);
       entries.push(['mute', `🔇 Mute audio (${a.kind}): ${onOff(current.mute)}`, () => toggleSetting('mute')]);
@@ -396,7 +401,7 @@
       h('button', {
         class: 'add',
         onclick: () => {
-          rules.push({ pattern: escapeRegex(HOST), awake: true, mute: false, webAudio: false });
+          rules.push({ pattern: escapeRegex(host()), awake: true, mute: false, webAudio: false });
           render();
           save();
           list.lastChild.querySelector('input').focus();
@@ -411,6 +416,17 @@
     render();
     panel = { reload: () => { rules = loadRules(); render(); } };
   }
+
+  // Single-page sites change the URL without reloading, so re-apply settings when it changes
+  let lastHref = location.href;
+  function checkUrl() {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    sync();
+  }
+  setInterval(checkUrl, 500);
+  window.addEventListener('popstate', checkUrl);
+  window.addEventListener('yt-navigate-finish', checkUrl);
 
   migrate();
   sync();
