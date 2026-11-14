@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Auto Twitch Queuer
 // @namespace    https://github.com/
-// @version      3.3.0
+// @version      3.3.1
 // @description  Queue a list of streams to open at specific times with automatic campaign farming. Also watch streams automatically.
 // @author       Main
 // @match        https://www.youtube.com/*/streams
@@ -344,7 +344,7 @@ function checkForHigherPriorityCampaign() {
                             var hasNew = pageCampaigns.some(function(c) {
                                 if (!isCampaignActive(c) || stalledNames.indexOf(c.name) !== -1) return false;
                                 var t = findTracked(trackedCampaigns, c);
-                                return !t || !t.completed;
+                                return !t || (!t.completed && !dailyDoneToday(t));
                             });
                             popupText("Debug: Checking stalled " + kind + gameName + " - " + summarize(pageCampaigns, trackedCampaigns, "stalled", "no campaigns read"));
                             if (hasNew) { triggeringGame = gameName; onDone(true); return; }
@@ -753,8 +753,8 @@ function isCampaignActive(c) {
 }
 
 // The campaign being farmed: by its key when the session has one, else by name, preferring an unfinished entry
-function getFarmedCampaign(gameName, campaignName) {
-    var list = getDropsTracker()[gameName];
+function getFarmedCampaign(gameName, campaignName, tracker) {
+    var list = (tracker || getDropsTracker())[gameName];
     if (!Array.isArray(list)) return undefined;
     var key = sessionStorage.getItem("farmingCampaignKey");
     if (key) {
@@ -797,6 +797,8 @@ function addCampaignToTracker(gameName, campaignName, endDate, extra) {
     if (extra.startMs && extra.startMs !== Infinity) existing.startMs = extra.startMs;
     // Reward campaigns never appear In Progress on the inventory page
     if (extra.reward) existing.reward = true;
+    if (extra.daily) existing.daily = extra.daily;
+    if (extra.panelNames && extra.panelNames.length > 0) existing.panelNames = extra.panelNames;
     setDropsTracker(tracker);
 }
 
@@ -834,12 +836,40 @@ function sweepExpiredCampaigns() {
     return swept.length;
 }
 
+// Daily goals ("Watch 60 min over 6 days") are counted per UTC day
+function utcDay() {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function dailyDoneToday(tracked) {
+    return !!(tracked && tracked.daily && Array.isArray(tracked.dailyDays) && tracked.dailyDays.indexOf(utcDay()) !== -1);
+}
+
+// Counts one watched minute toward today's goal. Returns the tracked campaign, or null if it has no daily goal
+function creditDailyMinute(gameName, campaignName) {
+    var tracker = getDropsTracker();
+    var c = getFarmedCampaign(gameName, campaignName, tracker);
+    if (!c || !c.daily || c.completed) return null;
+    var today = utcDay();
+    if (!Array.isArray(c.dailyDays)) c.dailyDays = [];
+    if (c.dailyDays.indexOf(today) !== -1) return c;
+    if (!c.dailyToday || c.dailyToday.date !== today) c.dailyToday = { date: today, minutes: 0 };
+    c.dailyToday.minutes++;
+    // 5 minutes over, since the first minutes on a stream don't always count
+    if (c.dailyToday.minutes >= c.daily.minutes + 5) {
+        c.dailyDays.push(today);
+        if (c.dailyDays.length >= c.daily.days) c.completed = true;
+    }
+    setDropsTracker(tracker);
+    return c;
+}
+
 // Shared by the campaigns pass and the priority check; only live campaigns on the page count
 function pageCampaignsHaveWork(trackedCampaigns, pageCampaigns) {
     return pageCampaigns.some(function(c) {
         if (!isCampaignActive(c)) return false;
         var t = findTracked(trackedCampaigns, c);
-        return !t || !t.completed;
+        return !t || (!t.completed && !dailyDoneToday(t));
     });
 }
 
@@ -856,49 +886,59 @@ function parseCampaignsFromRow(rowOrRows) {
     var rowList = Array.isArray(rowOrRows) ? rowOrRows : [rowOrRows];
     var campaigns = [];
     rowList.forEach(function(row) {
-        var nameEls = Array.from(row.querySelectorAll('strong')).filter(function(s) {
-            return !s.closest('.drop-details__label');
+        var nameEls = campaignNameEls(row);
+        nameEls.forEach(function(nameEl) {
+            var campaignName = nameEl.textContent.trim();
+            var endDateRaw = campaignDateFor(nameEl, row, nameEls);
+            var endDate = endDateRaw ? parseEndDateFromRange(endDateRaw) : null;
+            if (!campaignName || !endDate) return;
+            var block = dropCampaignBlockFor(nameEl, row, nameEls);
+            var classified = block ? classifyCampaignDrops(block) : { watch: [], other: [] };
+            var parsed = {
+                name: campaignName, endDate: endDate, endDateRaw: endDateRaw,
+                drops: classified.watch,
+                nonWatchDrops: classified.other,
+                startMs: parseRangeStartMs(endDateRaw),
+                block: block
+            };
+            parsed.key = campaignKey(parsed);
+            campaigns.push(parsed);
         });
-        var dateEls = Array.from(row.querySelectorAll('p')).filter(function(p) {
-            return p.textContent.includes(' - ') && !p.closest('.drop-details__label');
-        });
-        var count = Math.min(nameEls.length, dateEls.length);
-        for (var i = 0; i < count; i++) {
-            var campaignName = nameEls[i].textContent.trim();
-            var endDateRaw = dateEls[i].textContent.trim();
-            var endDate = parseEndDateFromRange(endDateRaw);
-            if (campaignName && endDate) {
-                var block = findDropCampaignBlock([row], campaignName);
-                var classified = block ? classifyCampaignDrops(block) : { watch: [], other: [] };
-                var parsed = {
-                    name: campaignName, endDate: endDate, endDateRaw: endDateRaw,
-                    drops: classified.watch,
-                    nonWatchDrops: classified.other,
-                    startMs: parseRangeStartMs(endDateRaw)
-                };
-                parsed.key = campaignKey(parsed);
-                campaigns.push(parsed);
-            }
-        }
     });
     return campaigns;
 }
 
-// Nearest ancestor of the campaign name holding its How to Earn label
-function findDropCampaignBlock(rows, campaignName) {
-    for (var r = 0; r < rows.length; r++) {
-        var nameEl = Array.from(rows[r].querySelectorAll('strong')).find(function(el) {
-            return !el.closest('.drop-details__label') && el.textContent.trim() === campaignName;
+// Campaign names are the bold titles outside section labels and requirement lists
+function campaignNameEls(row) {
+    return Array.from(row.querySelectorAll('strong')).filter(function(s) {
+        return !s.closest('.drop-details__label') && !s.closest('li');
+    });
+}
+
+function holdsOtherName(el, nameEl, nameEls) {
+    return nameEls.some(function(n) { return n !== nameEl && el.contains(n); });
+}
+
+// The "<start> - <end>" text in the nearest ancestor that holds this campaign name and no other
+function campaignDateFor(nameEl, row, nameEls) {
+    for (var el = nameEl.parentElement; el && row.contains(el); el = el.parentElement) {
+        if (holdsOtherName(el, nameEl, nameEls)) return null;
+        var dateEl = Array.from(el.querySelectorAll('p')).find(function(p) {
+            var t = p.textContent;
+            return t.indexOf(' - ') !== -1 && /\d{1,2}:\d{2}\s*(AM|PM)/i.test(t) && !p.closest('.drop-details__label');
         });
-        if (!nameEl) continue;
-        var el = nameEl.parentElement;
-        while (el && el !== rows[r]) {
-            var hasEarnLabel = Array.from(el.querySelectorAll('.drop-details__label'))
-                .some(function(lbl) { return /how to earn/i.test(lbl.textContent); });
-            if (hasEarnLabel) return el;
-            el = el.parentElement;
-        }
-        return null;
+        if (dateEl) return dateEl.textContent.trim();
+    }
+    return null;
+}
+
+// Nearest ancestor of the campaign name holding its How to Earn label, and no other campaign
+function dropCampaignBlockFor(nameEl, row, nameEls) {
+    for (var el = nameEl.parentElement; el && row.contains(el); el = el.parentElement) {
+        if (holdsOtherName(el, nameEl, nameEls)) return null;
+        var hasEarnLabel = Array.from(el.querySelectorAll('.drop-details__label'))
+            .some(function(lbl) { return /how to earn/i.test(lbl.textContent); });
+        if (hasEarnLabel) return el;
     }
     return null;
 }
@@ -911,23 +951,88 @@ function benefitNamesIn(el) {
     return names;
 }
 
-// Splits rewards into watch and non-watch, e.g. "Watch for 1 hour and claim the reward <span>Name</span>"
-function classifyCampaignDrops(block) {
+// Text directly inside el, without its child elements' text
+function ownText(el) {
+    return Array.from(el.childNodes).filter(function(n) { return n.nodeType === 3; })
+        .map(function(n) { return n.textContent; }).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+// Benefit image alts, else each reward tile's name line; "x3" quantity badges and "???" are not names
+function rewardNamesIn(el) {
+    var names = benefitNamesIn(el);
+    if (names.length > 0) return names;
+    el.querySelectorAll('.tw-tower > *').forEach(function(tile) {
+        var lines = tile.querySelectorAll('p');
+        for (var i = 0; i < lines.length; i++) {
+            var t = ownText(lines[i]);
+            if (!t || /^x\d+$/i.test(t)) continue;
+            if (t !== '???' && names.indexOf(t) === -1) names.push(t);
+            break;
+        }
+    });
+    return names;
+}
+
+// One group per requirement list in a campaign block, with the reward tiles listed above it
+function parseEarnGroups(block) {
+    var groups = [];
+    var rewards = [];
+    var panelNames = [];
+    block.querySelectorAll('.drop-details__label').forEach(function(label) {
+        var section = label.parentElement;
+        if (!section || /^(summary|progress & redemption|connection)/i.test(label.textContent.trim())) return;
+        rewards = mergeDropNames(rewards, rewardNamesIn(section));
+        section.querySelectorAll('strong').forEach(function(s) {
+            if (s.closest('.drop-details__label') || s.closest('li')) return;
+            panelNames = mergeDropNames(panelNames, [s.textContent.trim()]);
+        });
+        var ul = section.querySelector('ul');
+        if (!ul) return;
+        var group = { rewards: rewards, panelNames: panelNames, items: Array.from(ul.querySelectorAll('li')),
+            watch: false, daily: null, categoryName: null };
+        group.items.forEach(function(li) {
+            var text = li.textContent.replace(/\s+/g, ' ').trim();
+            // Matches "Watch for 20 minutes" and "Watch 20 minutes"
+            if (/watch\s+(for\s+)?\d+/i.test(text)) group.watch = true;
+            var daily = parseDailyGoal(text);
+            if (daily) group.daily = daily;
+            // "Go to a participating live channel in Grand Theft Auto VI" names a category without linking it
+            var category = text.match(/participating live channel in\s+(.+)$/i);
+            if (category && !group.categoryName) group.categoryName = category[1].trim();
+        });
+        groups.push(group);
+        rewards = [];
+        panelNames = [];
+    });
+    return groups;
+}
+
+// "Watch 60 min over 6 days" means 60 minutes on each of 6 different days
+function parseDailyGoal(text) {
+    var m = text.match(/watch\s+(?:for\s+)?(\d+)\s*(min|hour|hr)\w*\s+over\s+(\d+)\s+days?/i);
+    if (!m) return null;
+    var minutes = parseInt(m[1]) * (/^min/i.test(m[2]) ? 1 : 60);
+    return { minutes: minutes, days: parseInt(m[3]) };
+}
+
+// Splits rewards into watch and non-watch, per "claim the reward <span>Name</span>" line or else per group
+function classifyCampaignDrops(block, groups) {
     var watch = [];
     var other = [];
-    var earnLabel = Array.from(block.querySelectorAll('.drop-details__label'))
-        .find(function(lbl) { return /how to earn/i.test(lbl.textContent); });
-    var ul = earnLabel ? earnLabel.parentElement.querySelector('ul') : null;
-    if (ul) {
-        ul.querySelectorAll('li').forEach(function(li) {
+    function add(list, name) { if (name && list.indexOf(name) === -1) list.push(name); }
+    (groups || parseEarnGroups(block)).forEach(function(group) {
+        var named = false;
+        group.items.forEach(function(li) {
             if (!/claim the reward/i.test(li.textContent)) return;
             var spans = li.querySelectorAll('span');
             var name = spans.length > 0 ? spans[spans.length - 1].textContent.trim() : '';
             if (!name) return;
-            var list = /\bwatch\b/i.test(li.textContent) ? watch : other;
-            if (list.indexOf(name) === -1) list.push(name);
+            named = true;
+            add(/\bwatch\b/i.test(li.textContent) ? watch : other, name);
         });
-    }
+        if (named) return;
+        group.rewards.forEach(function(name) { add(group.watch ? watch : other, name); });
+    });
     // Unknown layout: fall back to treating every reward as watch-earned
     if (watch.length === 0 && other.length === 0) watch = benefitNamesIn(block);
     return { watch: watch, other: other };
@@ -959,21 +1064,22 @@ function parseRewardCampaignFromRow(game, row) {
     var dateEl = findRewardDateEl(row);
     var endDateRaw = dateEl ? dateEl.textContent.trim() : null;
     var endDate = endDateRaw ? parseEndDateFromRange(endDateRaw) : null;
-    var rewardNames = benefitNamesIn(row);
-    if (rewardNames.length === 0) {
-        var rewardsLabel = Array.from(row.querySelectorAll('.drop-details__label')).find(function(l) {
-            return l.textContent.trim() === 'Rewards';
-        });
-        if (rewardsLabel) {
-            rewardsLabel.parentElement.querySelectorAll('p').forEach(function(p) {
-                var t = p.textContent.trim();
-                if (t) rewardNames.push(t);
-            });
-        }
-    }
-    var name = rewardNames.length > 0 ? rewardNames[0] : (game.name + " Reward");
+    var groups = parseEarnGroups(row);
+    var classified = classifyCampaignDrops(row, groups);
+    var rewardNames = mergeDropNames(classified.watch, classified.other);
+    var titleEl = row.querySelector('.accordion-header p');
+    var title = titleEl ? titleEl.textContent.trim() : '';
+    var name = rewardNamesIn(row)[0] || rewardNames[0] || title || (game.name + " Reward");
+    var daily = null;
+    var panelNames = [];
+    groups.forEach(function(group) {
+        if (!group.watch) return;
+        if (group.daily && (!daily || group.daily.minutes > daily.minutes)) daily = group.daily;
+        panelNames = mergeDropNames(panelNames, group.panelNames);
+    });
     var parsed = { name: name, endDate: endDate, endDateRaw: endDateRaw, rewardRow: row,
-        drops: rewardNames, startMs: parseRangeStartMs(endDateRaw), reward: true };
+        drops: classified.watch, nonWatchDrops: classified.other, startMs: parseRangeStartMs(endDateRaw),
+        reward: true, daily: daily, panelNames: panelNames };
     parsed.key = campaignKey(parsed);
     return parsed;
 }
@@ -1664,7 +1770,7 @@ function openProgressManager() {
             'farmingNoProgressChecks', 'farmingStalledChecks',
             'farmingIsStallFallback', 'farmingSkipCampaigns',
             'farmingStallGameNames', 'farmingStallCampaigns', 'farmingStallSameGame', 'fallbackChannelIndex', 'farmingCampaignKey',
-            'farmingSkipChannels', 'atqInconclusiveChecks'
+            'farmingSkipChannels', 'atqInconclusiveChecks', 'farmingCategoryName'
         ].forEach(function(k) { kv(k, sessionStorage.getItem(k)); });
 
         section('Timers');
@@ -2087,8 +2193,13 @@ function getRewardRows(doc) {
 }
 
 function rewardRowGameName(row) {
-    var imgEl = row.querySelector('img.partner-thumbnail');
-    return imgEl && imgEl.alt ? imgEl.alt : null;
+    // The header image's class names churn, so it is found by position
+    var header = row.querySelector('.accordion-header');
+    if (!header) return null;
+    var imgEl = header.querySelector('img');
+    if (imgEl && imgEl.alt) return imgEl.alt;
+    var titleEl = header.querySelector('p');
+    return titleEl && titleEl.textContent.trim() ? titleEl.textContent.trim() : null;
 }
 
 function renderRewardButtons() {
@@ -2303,7 +2414,7 @@ function parseAllCampaignsAndQueue(game, matchingRows, rewardRows, list, idx, ex
     campaigns.forEach(function(campaign) {
         addCampaignToTracker(game.name, campaign.name, campaign.endDate, {
             drops: campaign.drops, nonWatchDrops: campaign.nonWatchDrops, startMs: campaign.startMs,
-            reward: campaign.reward, key: campaign.key
+            reward: campaign.reward, key: campaign.key, daily: campaign.daily, panelNames: campaign.panelNames
         });
     });
     var tracker = getDropsTracker();
@@ -2339,6 +2450,15 @@ function parseAllCampaignsAndQueue(game, matchingRows, rewardRows, list, idx, ex
     }
     // Rows list campaigns that haven't started yet, and keep ones that just ended
     var active = uncompleted.filter(isCampaignActive);
+    var resting = active.filter(function(c) { return dailyDoneToday(findTracked(tracker[game.name], c)); });
+    if (resting.length > 0) {
+        popupText(resting.map(function(c) { return c.name; }).join(", ") + " done for today, resumes after UTC midnight");
+        active = active.filter(function(c) { return resting.indexOf(c) === -1; });
+        if (active.length === 0) {
+            farmNextPriority(list, idx + 1);
+            return;
+        }
+    }
     if (active.length === 0) {
         var upcoming = uncompleted.filter(function(c) { return c.startMs && c.startMs > Date.now(); })
             .sort(function(a, b) { return a.startMs - b.startMs; });
@@ -2401,64 +2521,82 @@ function skipCampaignAndContinue(game, campaign, list, idx) {
     farmNextPriority(list, idx);
 }
 
-function queueCampaignStream(game, matchingRows, campaign, list, idx) {
-    var rows = Array.isArray(matchingRows) ? matchingRows : [matchingRows];
-    var targetBlock = null;
-    if (campaign.rewardRow) {
-        // Reward campaigns carry their accordion row
-        targetBlock = campaign.rewardRow;
-    } else {
-        targetBlock = findDropCampaignBlock(rows, campaign.name);
+// Twitch channel or category links in a requirement line
+function watchableLinks(li) {
+    return Array.from(li.querySelectorAll('a')).filter(function(a) {
+        var href = a.getAttribute('href') || '';
+        var isTwitchPage = (href.startsWith('/') && !href.startsWith('//')) || /^https?:\/\/(www\.)?twitch\.tv\//i.test(href);
+        return isTwitchPage && !href.includes('/drops/');
+    });
+}
+
+// Guessed category slug; Twitch doesn't always follow the name (CONTROL Resonant is "control-2")
+function categorySlugGuess(name) {
+    return name.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+        .replace(/['’.]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// Links from the watch line, then its list, then any list; else the category the requirement names
+function earnTarget(groups, watchGroups) {
+    function isWatchLine(li) { return /watch\s+(for\s+)?\d+/i.test(li.textContent); }
+    function hasLinks(li) { return watchableLinks(li).length > 0; }
+    function itemsOf(list) { return list.reduce(function(all, g) { return all.concat(g.items); }, []); }
+    var watchGroupItems = itemsOf(watchGroups);
+    var linkLi = watchGroupItems.filter(isWatchLine).find(hasLinks) || watchGroupItems.find(hasLinks) || itemsOf(groups).find(hasLinks);
+    if (linkLi) {
+        return { hrefs: watchableLinks(linkLi).map(function(a) { return a.getAttribute('href'); }) };
     }
+    var named = watchGroups.find(function(g) { return g.categoryName; });
+    if (!named) return null;
+    var wanted = named.categoryName.toLowerCase();
+    var known = Array.from(document.querySelectorAll('a[href*="/directory/category/"]')).find(function(a) {
+        return a.textContent.trim().toLowerCase() === wanted;
+    });
+    if (known) return { hrefs: [known.getAttribute('href')], categoryName: named.categoryName };
+    var slug = categorySlugGuess(named.categoryName);
+    if (!slug) return null;
+    return { hrefs: ["/directory/category/" + slug], categoryName: named.categoryName, guessed: true };
+}
+
+function queueCampaignStream(game, matchingRows, campaign, list, idx) {
+    // Reward campaigns carry their accordion row, drop campaigns their block within the row
+    var targetBlock = campaign.rewardRow || campaign.block;
     if (!targetBlock) {
         popupText("Could not find campaign block for: " + campaign.name + ", skipping");
         skipCampaignAndContinue(game, campaign, list, idx);
         return;
     }
-    // Matches "How to Earn the Drop" (drop campaigns) and "How To Earn The Reward" (reward campaigns)
-    var earnLabel = Array.from(targetBlock.querySelectorAll('.drop-details__label'))
-        .find(el => /how to earn/i.test(el.textContent));
-    if(!earnLabel) {
+    var groups = parseEarnGroups(targetBlock);
+    if (groups.length === 0) {
         popupText("Could not read drop details for: " + campaign.name + ", skipping");
         skipCampaignAndContinue(game, campaign, list, idx);
         return;
     }
-    var ul = earnLabel.parentElement.querySelector('ul');
-    if(!ul) {
-        popupText("Could not read drop details for: " + campaign.name + ", skipping");
-        skipCampaignAndContinue(game, campaign, list, idx);
-        return;
-    }
-    var items = Array.from(ul.querySelectorAll('li'));
-    // Matches "Watch for 20 minutes" and "Watch 20 minutes"; sub-only campaigns have neither
-    var watchItems = items.filter(li => /watch\s+(for\s+)?\d+/i.test(li.textContent));
-    if(watchItems.length === 0) {
+    // Sub-only campaigns have no watch requirement
+    var watchGroups = groups.filter(function(g) { return g.watch; });
+    if (watchGroups.length === 0) {
         popupText("No watchable drops for: " + campaign.name + ", marking complete");
         markCampaignCompleted(game.name, campaign, true);
         skipCampaignAndContinue(game, campaign, list, idx);
         return;
     }
-    // Prefer links in the watch item, else the first item with links; only Twitch channel/category links count
-    function watchableLinks(li) {
-        return Array.from(li.querySelectorAll('a')).filter(function(a) {
-            var href = a.getAttribute('href') || '';
-            var isTwitchPage = (href.startsWith('/') && !href.startsWith('//')) || /^https?:\/\/(www\.)?twitch\.tv\//i.test(href);
-            return isTwitchPage && !href.includes('/drops/');
-        });
-    }
-    var linkLi = watchItems.find(function(li) { return watchableLinks(li).length > 0; })
-        || items.find(function(li) { return watchableLinks(li).length > 0; });
-    var links = linkLi ? watchableLinks(linkLi) : [];
-    // A category link is tried first; channel-only lists go in listed order, main channel first
-    var hrefs = links.map(function(l) { return l.getAttribute('href'); });
-    var startIndex = hrefs.findIndex(function(h) { return h.includes("/directory/category"); });
-    if (startIndex === -1) startIndex = 0;
-    var streamHref = hrefs.length > 0 ? hrefs[startIndex] : null;
-    if(!streamHref) {
-        popupText("No stream link found for: " + campaign.name + ", skipping");
+    var target = earnTarget(groups, watchGroups);
+    if (!target) {
+        popupText("No stream link or category found for: " + campaign.name + ", skipping");
         skipCampaignAndContinue(game, campaign, list, idx);
         return;
     }
+    var hrefs = target.hrefs;
+    // A category link is tried first; channel-only lists go in listed order, main channel first
+    var startIndex = hrefs.findIndex(function(h) { return h.includes("/directory/category"); });
+    if (startIndex === -1) startIndex = 0;
+    var streamHref = hrefs[startIndex];
+    if (target.categoryName) {
+        popupText(campaign.name + " has no link, using the " + target.categoryName + " category" + (target.guessed ? " (guessed URL " + streamHref + ")" : ""));
+    }
+    // A guessed URL is checked against the category page's title once it loads
+    if (target.guessed) sessionStorage.setItem("farmingCategoryName", target.categoryName);
+    else sessionStorage.removeItem("farmingCategoryName");
     sessionStorage.setItem("farmingAllLinks", JSON.stringify(hrefs));
     sessionStorage.setItem("farmingLinkIndex", String(startIndex));
     sessionStorage.removeItem("farmingSkipChannels");
@@ -2486,6 +2624,7 @@ function clearFarmingSessionState() {
     sessionStorage.removeItem("farmingGameName");
     sessionStorage.removeItem("farmingCampaignName");
     sessionStorage.removeItem("farmingCampaignKey");
+    sessionStorage.removeItem("farmingCategoryName");
     sessionStorage.removeItem("farmingSkipChannels");
     sessionStorage.removeItem("atqInconclusiveChecks");
     sessionStorage.removeItem("farmingGameIdx");
@@ -2963,7 +3102,7 @@ function readWatchDropsPanel() {
 // The panel lists rewards, not campaigns, so match by drop name. Without names there is no telling
 // this campaign's items from another campaign of the same game, so the inventory decides instead.
 function watchDropsForCampaign(items, campaign) {
-    var names = (campaign.drops || []).concat(campaign.nonWatchDrops || []);
+    var names = (campaign.drops || []).concat(campaign.nonWatchDrops || [], campaign.panelNames || []);
     return items.filter(function(d) { return names.indexOf(d.name) !== -1; });
 }
 
@@ -3143,9 +3282,9 @@ function runInventoryCheck() {
             var live = inv.campaigns.find(function(c) { return c.name === campaignName && sameEndDate(c.endDate, tracked.endDate); });
             if (!live && tracked.reward) {
                 // Reward campaigns are never In Progress, so absence isn't a miss. Without a readable
-                // Watch Drops panel there is no progress to see, so the same 30 minute limit applies.
+                // Watch Drops panel the 30 minute limit applies, except to daily goals, which count minutes.
                 var since = parseInt(sessionStorage.getItem("farmingPanelChangedAt") || "0");
-                if (since && Date.now() - since > 30 * 60000) {
+                if (!tracked.daily && since && Date.now() - since > 30 * 60000) {
                     stopInventoryChecking();
                     popupText(campaignName + " shows no progress for 30 min. Treating as stalled, trying next link");
                     tryNextAvailableLink(gameName, campaignName);
@@ -3201,6 +3340,15 @@ function startInventoryChecking() {
     }
 
     function iframeTick() {
+        if (isChannelPage() && checkCurrentStreamAlive() !== false) {
+            var daily = creditDailyMinute(gameName, campaignName);
+            if (daily && (daily.completed || dailyDoneToday(daily))) {
+                stopInventoryChecking();
+                popupText("Daily goal reached for " + campaignName + " (day " + daily.dailyDays.length + " of " + daily.daily.days + "). Returning to campaigns");
+                cleanRedirect("https://www.twitch.tv/drops/campaigns");
+                return;
+            }
+        }
         var elapsed = parseInt(sessionStorage.getItem("inventoryCheckElapsedMinutes") || "0") + 1;
         if (elapsed >= checkIntervalMinutes) {
             sessionStorage.setItem("inventoryCheckElapsedMinutes", "0");
@@ -3562,7 +3710,13 @@ async function detectSite() {
         } else if (locationContains("?filter=drops&sort=VIEWER_COUNT")) {
             // Loop leads to 5 then back if disruption is found
             popupText("ALWU: 4 - Twitch Category Watcher detected");
+            // A guessed category URL may not exist, and this wait has no timeout of its own
+            var guessedCategory = sessionStorage.getItem("farmingCategoryName");
+            var guessedTimer = guessedCategory ? setTimeout(function() {
+                failGuessedCategory("Category page for " + guessedCategory + " did not load");
+            }, 60000) : null;
             const elm = await waitForElm(".directory-header-new__info");
+            clearTimeout(guessedTimer);
 
             sessionStorage.removeItem("twitchAboutLocation");
 
@@ -3738,6 +3892,16 @@ function twitchCategoryWatcher() {
     // Go through live streams with drops and click the first one available
     resetToLocation = window.location.href;
     sessionStorage.setItem("twitchWatchedCategory", resetToLocation);
+    var expectedCategory = sessionStorage.getItem("farmingCategoryName");
+    if (expectedCategory) {
+        var titleEl = document.querySelector('.directory-header-new__info h1') || document.querySelector('h1');
+        var title = titleEl ? titleEl.textContent.trim() : "";
+        if (title && title.toLowerCase() !== expectedCategory.toLowerCase()) {
+            loopingInterval = resetInterval(loopingInterval);
+            failGuessedCategory("Category page is " + title + ", expected " + expectedCategory);
+            return;
+        }
+    }
     var liveStreamList = $(".preview-card-image-link");
 
     if (liveStreamList.length == 0 && noDropStreamsAvailable == null) {
@@ -3766,6 +3930,16 @@ function twitchCategoryWatcher() {
             categoryEmpty();
         }
     }
+}
+
+// The category URL guessed from a campaign's category name turned out wrong
+function failGuessedCategory(message) {
+    var gn = sessionStorage.getItem("farmingGameName");
+    var cn = sessionStorage.getItem("farmingCampaignName");
+    sessionStorage.removeItem("farmingCategoryName");
+    if (sessionStorage.getItem("AutoTwitchQueuerAutoFarmCampaigns") != "true" || !gn || !cn) return;
+    popupText(message + ", trying next link");
+    tryNextAvailableLink(gn, cn);
 }
 
 // While farming, treat an empty category like an offline stream instead of reloading it
