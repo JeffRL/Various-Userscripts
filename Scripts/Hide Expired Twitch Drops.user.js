@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Hide Expired Twitch Drops
 // @namespace    https://www.twitch.tv/drops/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Hide Expired Twitch Drops
 // @author       Main
 // @match        https://www.twitch.tv/drops/inventory
@@ -22,7 +22,7 @@ main();
 async function main() {
     const elm = await waitForElm(".inventory-max-width");
     var expiredDrops = $(".inventory-max-width").children("*:contains('This reward is no longer available')");
-    expiredDrops.addClass("DropsHideExpired");
+    expiredDrops.attr('style', function(i,s) { return (s || '') + 'display: none !important;' });
 }
 
 function waitForElm(selector) {
